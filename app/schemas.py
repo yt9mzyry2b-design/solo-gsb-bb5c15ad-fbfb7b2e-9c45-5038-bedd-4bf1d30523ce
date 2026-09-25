@@ -291,6 +291,35 @@ class ChunkAuditResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 成品完整性巡检（integrity-check）
+# ---------------------------------------------------------------------------
+
+
+class IntegrityCheckResponse(BaseModel):
+    """成品巡检结论；文件缺失/长度不符/摘要不符时已持久化隔离标记。"""
+
+    session_id: str
+    status: str = Field(
+        ..., description="ok / missing / length_mismatch / sha256_mismatch"
+    )
+    quarantined: bool = Field(
+        ..., description="巡检后会话是否处于隔离状态（下载与票据均被拒绝）"
+    )
+    declared_size: int = Field(..., description="会话声明的成品字节数（total_size）")
+    size_on_disk: int | None = Field(
+        default=None, description="成品文件的实际字节数；文件缺失时为 null"
+    )
+    expected_sha256: str = Field(..., description="会话声明的整文件 SHA-256")
+    actual_sha256: str | None = Field(
+        default=None, description="成品文件的实际 SHA-256；文件缺失时为 null"
+    )
+    quarantined_at: str | None = Field(
+        default=None, description="隔离标记写入时间（UTC，ISO-8601 带 Z）；未隔离为 null"
+    )
+    checked_at: str = Field(..., description="本次巡检执行时间（UTC，ISO-8601 带 Z）")
+
+
+# ---------------------------------------------------------------------------
 # 受控下载票据
 # ---------------------------------------------------------------------------
 

@@ -409,7 +409,7 @@ def test_legacy_chunks_are_baseline_and_new_upload_continues_from_seq_one(
 
 
 def test_init_db_migrates_v4_database(monkeypatch, tmp_path: Path) -> None:
-    """v4 老库（含 chunk_claims）平滑升级到 v5：新增 chunk_events，老数据保留。"""
+    """v4 老库（含 chunk_claims）平滑升级到最新结构：新增 chunk_events 等，老数据保留。"""
     db_file = tmp_path / "v4.db"
     raw = sqlite3.connect(str(db_file))
     for step in (
@@ -441,7 +441,7 @@ def test_init_db_migrates_v4_database(monkeypatch, tmp_path: Path) -> None:
     try:
         db.init_db()
         conn = db.get_conn()
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.LATEST_USER_VERSION
         # 老数据保留，且旧 chunks 不回填事件。
         assert conn.execute(
             "SELECT COUNT(*) AS n FROM chunks WHERE session_id = 'sid7'"
@@ -469,6 +469,6 @@ def test_init_db_migrates_v4_database(monkeypatch, tmp_path: Path) -> None:
                 "VALUES ('sid7', 1, 0, 10, 'copy', '2026-01-03T00:01:00Z')"
             )
         db.init_db()
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.LATEST_USER_VERSION
     finally:
         db._local.conn = None

@@ -253,6 +253,29 @@ def hash_part_file(session_id: str, start: int, end: int) -> tuple[int, str] | N
     return size, sha.hexdigest()
 
 
+def hash_artifact_file(session_id: str) -> tuple[int, str] | None:
+    """流式读取已完成会话的成品文件，返回 (实际字节数, SHA-256)；缺失返回 None。
+
+    与 :func:`hash_part_file` 同一口径：字节数按实际读取统计（不经 stat），
+    纯只读，供成品完整性巡检使用。调用方必须持有会话锁，保证读取期间
+    成品不会被删除会话流程清理。
+    """
+    path = artifact_path(session_id)
+    sha = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as fh:
+            while True:
+                block = fh.read(1024 * 1024)
+                if not block:
+                    break
+                sha.update(block)
+                size += len(block)
+    except FileNotFoundError:
+        return None
+    return size, sha.hexdigest()
+
+
 def atomic_publish(tmp_file: str, session_id: str) -> None:
     """把拼装好的临时文件原子替换为成品文件。"""
     os.replace(tmp_file, artifact_path(session_id))

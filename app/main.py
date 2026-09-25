@@ -13,6 +13,7 @@
   POST   /sessions/{id}/complete        原子完成（区间全覆盖 + SHA-256 校验）
   DELETE /sessions/{id}                 放弃会话
   GET    /sessions/{id}/download        会话下载（原有接口，不计数）
+  POST   /sessions/{id}/integrity-check 成品完整性巡检：流式核对长度与 SHA-256，异常即隔离
   POST   /sessions/{id}/tickets         签发受控下载票据（有效期 + 次数上限）
   GET    /tickets/{ticket}/download     凭票下载（原子扣减一次，支持 Range）
   POST   /tickets/{ticket}/revoke       撤销票据
@@ -33,7 +34,7 @@ from anyio.to_thread import run_sync
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse
 
-from . import claims, db, idempotency, schemas, settings, storage
+from . import claims, db, idempotency, integrity, schemas, settings, storage
 from .cleanup import start_janitor
 from .locks import session_locks
 
@@ -1553,14 +1554,109 @@ def download_session(session_id: str) -> FileResponse:
         "SELECT filename FROM upload_sessions WHERE id = ? AND status = 'completed'",
         (session_id,),
     ).fetchone()
+    if row is None:
+        raise _http(404, "no completed artifact for this session")
+    # 隔离会话拒绝下载：成品未通过完整性巡检，不得再对外分发。
+    # 标记优先于成品存在性判定：无论文件是否还在，隔离都是拒绝的权威原因。
+    mark = integrity.get_mark(conn, session_id)
+    if mark is not None:
+        raise _http(
+            423,
+            "session quarantined",
+            reason=mark["reason"],
+            quarantined_at=mark["created_at"],
+        )
     path = storage.artifact_path(session_id)
-    if row is None or not path.is_file():
+    if not path.is_file():
         raise _http(404, "no completed artifact for this session")
     return FileResponse(
         path,
         media_type="application/octet-stream",
         filename=storage.safe_filename(row["filename"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# 成品完整性巡检（POST /integrity-check）与隔离
+#
+# 对已完成会话的成品流式计算 SHA-256，核对声明长度（total_size）与预期摘要
+# （sha256_expected）：
+#   * 校验通过：返回实际长度与摘要，不改变会话的任何状态（也不清除已有
+#     隔离标记——已完成会话的成品不可变，标记只能随会话删除消失）；
+#   * 文件缺失 / 长度不符 / 摘要不符：在会话锁内的单个 IMMEDIATE 事务中
+#     持久化隔离标记（quarantine_marks，每会话至多一条，重复巡检 UPSERT
+#     刷新），并返回具体原因。被隔离会话的会话下载、票据签发与凭票下载
+#     一律拒绝（423）；凭票下载的判定在原子扣减之前，拒绝绝不扣减次数。
+# 巡检全程持有会话锁，与删除会话（DELETE /sessions/{id}）按同一把锁串行：
+# 删除先则巡检看到 404、不写任何标记；巡检先则删除排队，随后删除时标记
+# 经 ON DELETE CASCADE 与会话行同事务清除，不可能为已删除会话重新写入。
+# ---------------------------------------------------------------------------
+
+
+def _integrity_check(session_id: str) -> dict:
+    """持会话锁完成成品巡检；失败时在同一锁内持久化隔离标记。"""
+    with session_locks.get(session_id):
+        row = _load_session(session_id)
+        if row["status"] != "completed":
+            raise _http(409, "session is not completed; no artifact to inspect")
+
+        checked_at = storage.iso(storage.utcnow())
+        disk = storage.hash_artifact_file(session_id)
+        status = integrity.evaluate(
+            disk, row["total_size"], row["sha256_expected"]
+        )
+        size_on_disk, actual_sha256 = disk if disk is not None else (None, None)
+
+        if status == integrity.OK:
+            # 校验通过：只读返回，不改变会话（已有隔离标记也原样保留）。
+            mark = integrity.get_mark(db.get_conn(), session_id)
+            return {
+                "session_id": session_id,
+                "status": status,
+                "quarantined": mark is not None,
+                "declared_size": row["total_size"],
+                "size_on_disk": size_on_disk,
+                "expected_sha256": row["sha256_expected"],
+                "actual_sha256": actual_sha256,
+                "quarantined_at": mark["created_at"] if mark is not None else None,
+                "checked_at": checked_at,
+            }
+
+        # 失败：持锁在单个 IMMEDIATE 事务内持久化隔离标记。事务内复查会话
+        # 仍存在且仍为 completed——与删除会话按同一把会话锁串行，这里只是
+        # 防御性复核；会话若已删除则抛错回滚，绝不重新写入标记。
+        now_iso = storage.iso(storage.utcnow())
+        with db.immediate() as tx:
+            current = tx.execute(
+                "SELECT status FROM upload_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if current is None:
+                raise _http(404, "session not found")
+            if current["status"] != "completed":
+                raise _http(409, "session is not completed; no artifact to inspect")
+            integrity.persist_mark(tx, session_id, status, now_iso)
+
+        return {
+            "session_id": session_id,
+            "status": status,
+            "quarantined": True,
+            "declared_size": row["total_size"],
+            "size_on_disk": size_on_disk,
+            "expected_sha256": row["sha256_expected"],
+            "actual_sha256": actual_sha256,
+            "quarantined_at": now_iso,
+            "checked_at": checked_at,
+        }
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/integrity-check",
+    response_model=schemas.IntegrityCheckResponse,
+    tags=["sessions"],
+)
+def integrity_check(session_id: str) -> dict:
+    """对已完成会话的成品流式巡检：核对声明长度与预期 SHA-256，异常即隔离。"""
+    return _integrity_check(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1612,7 +1708,18 @@ def create_ticket(
             "SELECT id FROM upload_sessions WHERE id = ? AND status = 'completed'",
             (session_id,),
         ).fetchone()
-        if row is None or not storage.artifact_path(session_id).is_file():
+        if row is None:
+            raise _http(409, "no completed artifact for this session")
+        # 隔离会话拒绝签发新票据：成品未通过完整性巡检。
+        mark = integrity.get_mark(tx, session_id)
+        if mark is not None:
+            raise _http(
+                423,
+                "session quarantined",
+                reason=mark["reason"],
+                quarantined_at=mark["created_at"],
+            )
+        if not storage.artifact_path(session_id).is_file():
             raise _http(409, "no completed artifact for this session")
         tx.execute(
             "INSERT INTO download_tickets ("
@@ -1670,8 +1777,21 @@ def _claim_ticket_download(credential: str) -> tuple[sqlite3.Row, sqlite3.Row]:
             "WHERE id = ? AND status = 'completed'",
             (ticket["session_id"],),
         ).fetchone()
+        if session is None:
+            raise _http(404, "no completed artifact for this session")
+
+        # 隔离会话拒绝凭票下载：判定在扣减之前，抛错即回滚，绝不扣减次数。
+        mark = integrity.get_mark(tx, ticket["session_id"])
+        if mark is not None:
+            raise _http(
+                423,
+                "session quarantined",
+                reason=mark["reason"],
+                quarantined_at=mark["created_at"],
+            )
+
         path = storage.artifact_path(ticket["session_id"])
-        if session is None or not path.is_file():
+        if not path.is_file():
             raise _http(404, "no completed artifact for this session")
 
         # 原子扣减：WHERE 重放全部前置条件，两个并发请求在此串行，

@@ -117,6 +117,7 @@ def snapshot_read() -> Iterator[sqlite3.Connection]:
 #   v3：idempotency_keys（创建会话幂等键）
 #   v4：chunk_claims（分片认领令牌，仅存令牌 SHA-256）
 #   v5：chunk_events（分片接收事件流，同会话序号单调递增，用于断线重连增量同步）
+#   v6：quarantine_marks（成品完整性巡检的隔离标记，每会话至多一条）
 # 全部 DDL 均为 IF NOT EXISTS，重复执行安全；老库数据在迁移中保留。
 # ---------------------------------------------------------------------------
 
@@ -244,6 +245,23 @@ CREATE INDEX IF NOT EXISTS idx_chunk_events_session_seq
     ON chunk_events(session_id, seq);
 """
 
+MIGRATION_6 = """
+-- 成品完整性巡检的隔离标记：POST /sessions/{id}/integrity-check 发现已完成
+-- 会话的成品文件缺失、长度不符或摘要不符时写入；每个会话至多一条（主键），
+-- 重复巡检以 UPSERT 刷新原因与时间。被隔离会话的会话下载、票据签发与
+-- 凭票下载一律拒绝（凭票下载在扣减前判定，拒绝绝不扣减次数）。
+-- 删除会话时标记经 ON DELETE CASCADE 与会话行同事务清除；巡检与删除按
+-- 同一会话锁串行，已删除会话不会被重新写入标记（见 main.integrity_check）。
+CREATE TABLE IF NOT EXISTS quarantine_marks (
+    session_id    TEXT PRIMARY KEY
+                        REFERENCES upload_sessions(id) ON DELETE CASCADE,
+    reason        TEXT NOT NULL
+                        CHECK (reason IN ('missing', 'length_mismatch',
+                                          'sha256_mismatch')),
+    created_at    TEXT NOT NULL
+);
+"""
+
 # 版本号 -> 迁移脚本；版本号同时写入 PRAGMA user_version。
 _MIGRATIONS: dict[int, str] = {
     1: MIGRATION_1,
@@ -251,6 +269,7 @@ _MIGRATIONS: dict[int, str] = {
     3: MIGRATION_3,
     4: MIGRATION_4,
     5: MIGRATION_5,
+    6: MIGRATION_6,
 }
 LATEST_USER_VERSION = max(_MIGRATIONS)
 
