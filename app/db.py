@@ -117,6 +117,7 @@ def snapshot_read() -> Iterator[sqlite3.Connection]:
 #   v3：idempotency_keys（创建会话幂等键）
 #   v4：chunk_claims（分片认领令牌，仅存令牌 SHA-256）
 #   v5：chunk_events（分片接收事件流，同会话序号单调递增，用于断线重连增量同步）
+#   v6：integrity_quarantine（成品完整性巡检的隔离标记，随会话删除级联清除）
 # 全部 DDL 均为 IF NOT EXISTS，重复执行安全；老库数据在迁移中保留。
 # ---------------------------------------------------------------------------
 
@@ -244,6 +245,26 @@ CREATE INDEX IF NOT EXISTS idx_chunk_events_session_seq
     ON chunk_events(session_id, seq);
 """
 
+MIGRATION_6 = """
+-- 成品完整性巡检的隔离标记：POST /sessions/{id}/integrity-check 发现成品
+-- 文件缺失、实际长度与声明 total_size 不符、或实际 SHA-256 与预期摘要不符时，
+-- 在持有会话锁的 IMMEDIATE 事务内持久化（同会话重复巡检为 upsert，幂等）。
+-- 标记一旦写入，会话下载、凭票下载与票据签发全部被拒绝；
+-- 标记只能随会话删除经 ON DELETE CASCADE 清除——巡检与删除按同一会话锁
+-- 串行，且写入前在事务内复核会话仍存在，已删除会话绝不会被重新写入标记。
+CREATE TABLE IF NOT EXISTS integrity_quarantine (
+    session_id    TEXT PRIMARY KEY
+                        REFERENCES upload_sessions(id) ON DELETE CASCADE,
+    reason        TEXT NOT NULL
+                        CHECK (reason IN ('missing',
+                                          'length_mismatch',
+                                          'sha256_mismatch')),
+    actual_size   INTEGER CHECK (actual_size IS NULL OR actual_size >= 0),
+    actual_sha256 TEXT,
+    created_at    TEXT NOT NULL
+);
+"""
+
 # 版本号 -> 迁移脚本；版本号同时写入 PRAGMA user_version。
 _MIGRATIONS: dict[int, str] = {
     1: MIGRATION_1,
@@ -251,6 +272,7 @@ _MIGRATIONS: dict[int, str] = {
     3: MIGRATION_3,
     4: MIGRATION_4,
     5: MIGRATION_5,
+    6: MIGRATION_6,
 }
 LATEST_USER_VERSION = max(_MIGRATIONS)
 

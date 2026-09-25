@@ -11,10 +11,11 @@
   POST   /sessions/{id}/chunk-claims    认领尚未接收的半开区间，返回一次性随机令牌（5 分钟有效）
   POST   /sessions/{id}/copy-chunk      从已完成来源会话的成品服务端复制一段为目标会话分片
   POST   /sessions/{id}/complete        原子完成（区间全覆盖 + SHA-256 校验）
-  DELETE /sessions/{id}                 放弃会话
-  GET    /sessions/{id}/download        会话下载（原有接口，不计数）
-  POST   /sessions/{id}/tickets         签发受控下载票据（有效期 + 次数上限）
-  GET    /tickets/{ticket}/download     凭票下载（原子扣减一次，支持 Range）
+  DELETE /sessions/{id}                 放弃会话（级联清除隔离标记）
+  GET    /sessions/{id}/download        会话下载（原有接口，不计数；已隔离会话拒绝）
+  POST   /sessions/{id}/integrity-check 成品完整性巡检：流式核对 SHA-256 与声明长度，不符则持久化隔离标记
+  POST   /sessions/{id}/tickets         签发受控下载票据（有效期 + 次数上限；已隔离会话拒绝）
+  GET    /tickets/{ticket}/download     凭票下载（原子扣减一次，支持 Range；已隔离会话拒绝且不扣减）
   POST   /tickets/{ticket}/revoke       撤销票据
   GET    /storage/summary              运维只读：按四种状态汇总会话与字节数
 """
@@ -414,7 +415,7 @@ def abort_session(session_id: str) -> Response:
         with db.immediate() as tx:
             tx.execute(
                 "DELETE FROM upload_sessions WHERE id = ?", (session_id,)
-            )  # chunks 由 ON DELETE CASCADE 删除
+            )  # chunks/tickets/claims/events 与隔离标记由 ON DELETE CASCADE 删除
         storage.remove_session_tree(session_id)
     session_locks.discard(session_id)
     return Response(status_code=204)
@@ -1553,14 +1554,146 @@ def download_session(session_id: str) -> FileResponse:
         "SELECT filename FROM upload_sessions WHERE id = ? AND status = 'completed'",
         (session_id,),
     ).fetchone()
+    if row is None:
+        raise _http(404, "no completed artifact for this session")
+    # 已隔离会话拒绝下载（隔离标记由巡检在会话锁内写入，此处只读最新提交）。
+    _raise_if_quarantined(conn, session_id)
     path = storage.artifact_path(session_id)
-    if row is None or not path.is_file():
+    if not path.is_file():
         raise _http(404, "no completed artifact for this session")
     return FileResponse(
         path,
         media_type="application/octet-stream",
         filename=storage.safe_filename(row["filename"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# 成品完整性巡检（POST /integrity-check）
+#
+# 对已完成会话的成品流式计算 SHA-256，并核对声明长度（total_size）与预期
+# 摘要（sha256_expected）。三种失败都会持久化隔离标记并返回具体原因：
+#   missing          成品文件缺失
+#   length_mismatch  实际长度与声明 total_size 不符
+#   sha256_mismatch  长度正确但摘要不符
+# 校验通过只返回实际长度与摘要，不写库、不改变会话（既有隔离标记保持原样，
+# 标记只能随会话删除经 ON DELETE CASCADE 清除）。
+#
+# 巡检全程持有会话锁，与删除会话（DELETE /sessions/{id}）按同一把锁串行：
+# 流式核对期间成品不会被删除；标记写入在 IMMEDIATE 事务内复核会话仍存在
+# 且 completed 后才落库，已删除会话绝不会被重新写入标记。隔离生效后，
+# 会话下载、凭票下载与票据签发全部拒绝；凭票下载在扣减次数之前判定，
+# 被拒时不扣减。
+# ---------------------------------------------------------------------------
+
+
+def _raise_if_quarantined(conn: sqlite3.Connection, session_id: str) -> None:
+    """会话已被巡检隔离时抛 403；否则什么都不做（只读）。"""
+    row = conn.execute(
+        "SELECT reason, created_at FROM integrity_quarantine WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    if row is not None:
+        raise _http(
+            403,
+            "session quarantined by integrity check",
+            reason=row["reason"],
+            quarantined_at=row["created_at"],
+        )
+
+
+def _integrity_check(session_id: str) -> dict:
+    """持会话锁流式核对成品；失败时在事务内复核后持久化隔离标记。"""
+    with session_locks.get(session_id):
+        row = _load_session(session_id)
+        if row["status"] != "completed":
+            raise _http(
+                409,
+                "integrity check requires a completed session",
+                session_status=row["status"],
+            )
+
+        # 流式读取成品：字节数按实际读取统计，读取与长度核对之间无竞态；
+        # 会话锁保证核对期间删除会话无法插入，成品是稳定状态。
+        disk = storage.hash_artifact(session_id)
+        if disk is None:
+            reason: str | None = "missing"
+            actual_size: int | None = None
+            actual_sha: str | None = None
+        else:
+            actual_size, actual_sha = disk
+            if actual_size != row["total_size"]:
+                reason = "length_mismatch"
+            elif actual_sha != row["sha256_expected"]:
+                reason = "sha256_mismatch"
+            else:
+                reason = None
+
+        if reason is None:
+            # 校验通过：只返回实际长度与摘要，不写库、不改变会话。
+            # 已存在的隔离标记保持原样（只能随会话删除清除）。
+            existing = db.get_conn().execute(
+                "SELECT created_at FROM integrity_quarantine WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return {
+                "session_id": session_id,
+                "status": "ok",
+                "quarantined": existing is not None,
+                "actual_size": actual_size,
+                "actual_sha256": actual_sha,
+                "expected_size": row["total_size"],
+                "expected_sha256": row["sha256_expected"],
+                "quarantined_at": existing["created_at"] if existing else None,
+            }
+
+        # 失败：在 IMMEDIATE 事务内复核会话仍存在且 completed 后持久化
+        # 隔离标记（upsert，重复巡检幂等）。删除会话持同一把会话锁，此处
+        # 看到的会话不可能在写入前被删除；外键约束兜底，已删除会话绝不会
+        # 被重新写入标记。
+        now_iso = storage.iso(storage.utcnow())
+        with db.immediate() as tx:
+            current = tx.execute(
+                "SELECT status FROM upload_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if current is None:
+                raise _http(404, "session not found")
+            if current["status"] != "completed":
+                raise _http(
+                    409,
+                    "integrity check requires a completed session",
+                    session_status=current["status"],
+                )
+            tx.execute(
+                "INSERT INTO integrity_quarantine "
+                "(session_id, reason, actual_size, actual_sha256, created_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "reason = excluded.reason, actual_size = excluded.actual_size, "
+                "actual_sha256 = excluded.actual_sha256, "
+                "created_at = excluded.created_at",
+                (session_id, reason, actual_size, actual_sha, now_iso),
+            )
+        return {
+            "session_id": session_id,
+            "status": reason,
+            "quarantined": True,
+            "actual_size": actual_size,
+            "actual_sha256": actual_sha,
+            "expected_size": row["total_size"],
+            "expected_sha256": row["sha256_expected"],
+            "quarantined_at": now_iso,
+        }
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/integrity-check",
+    response_model=schemas.IntegrityCheckResponse,
+    tags=["sessions"],
+)
+def integrity_check(session_id: str) -> dict:
+    """对已完成会话的成品做完整性巡检；不符则隔离并返回具体原因。"""
+    return _integrity_check(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1614,6 +1747,9 @@ def create_ticket(
         ).fetchone()
         if row is None or not storage.artifact_path(session_id).is_file():
             raise _http(409, "no completed artifact for this session")
+        # 已隔离会话拒绝签发：与巡检的标记写入经 BEGIN IMMEDIATE 串行，
+        # 这里读到的是最新已提交状态。
+        _raise_if_quarantined(tx, session_id)
         tx.execute(
             "INSERT INTO download_tickets ("
             "id, session_id, token_hash, max_downloads, remaining_downloads, "
@@ -1673,6 +1809,8 @@ def _claim_ticket_download(credential: str) -> tuple[sqlite3.Row, sqlite3.Row]:
         path = storage.artifact_path(ticket["session_id"])
         if session is None or not path.is_file():
             raise _http(404, "no completed artifact for this session")
+        # 已隔离会话的凭票下载在扣减之前拒绝：异常使事务回滚，绝不扣减次数。
+        _raise_if_quarantined(tx, ticket["session_id"])
 
         # 原子扣减：WHERE 重放全部前置条件，两个并发请求在此串行，
         # 后到者的 remaining_downloads 已是 0，rowcount=0 → 429，绝不超额。
